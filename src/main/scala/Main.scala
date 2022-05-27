@@ -7,12 +7,9 @@ import com.azure.core.management.profile.AzureProfile
 import com.azure.resourcemanager.AzureResourceManager
 import com.azure.resourcemanager.compute.models.{ImageReference, PowerState, VirtualMachine, VirtualMachineSizeTypes}
 import net.schmizz.sshj.SSHClient
-import net.schmizz.sshj.common.IOUtils
-import net.schmizz.sshj.connection.channel.direct.Session
-import net.schmizz.sshj.sftp.{FileMode, OpenMode}
+import net.schmizz.sshj.connection.channel.direct.Signal
 import net.schmizz.sshj.transport.verification.PromiscuousVerifier
 import org.rogach.scallop.{ScallopConf, ScallopOption}
-import os.perms
 import reactor.core.publisher.{Flux, Mono}
 
 import java.net.ConnectException
@@ -26,6 +23,7 @@ import upickle.default._
 
 import java.util.concurrent.TimeUnit
 import scala.collection.mutable
+import scala.util.control.NonFatal
 
 object Main {
   final class Config(args: Seq[String]) extends ScallopConf(args) {
@@ -48,8 +46,7 @@ object Main {
   final case class ExperimentsData(name: String,
                                    experimentRepetitions: Int,
                                    vmSize: VirtualMachineSizeTypes = VirtualMachineSizeTypes.STANDARD_B4MS,
-                                   clientProvisionCmd: String,
-                                   serverProvisionCmd: String,
+                                   provisionCmd: String,
                                    experiments: List[ExperimentData]) {
     def experimentInstances: List[ExperimentDataInstance] = {
       val instances = experiments.flatMap(_.instances(this))
@@ -66,7 +63,7 @@ object Main {
                                   serverCmd: String,
                                   keyConfigs: List[String] = Nil,
                                   serverCount: Quantity[Int],
-                                  config: Map[String,AnyQuantity]) {
+                                  config: Map[String,AnyQuantity] = Map.empty) {
     def instances(experimentsData: ExperimentsData): List[ExperimentDataInstance] =
       serverCount.values
         .flatMap { serverCount =>
@@ -122,8 +119,7 @@ object Main {
   }
 
   class FolderStructure(root: os.Path) {
-    val clientImage = new ImageFolder(root / "client_image")
-    val serverImage = new ImageFolder(root / "server_image")
+    val image = new ImageFolder(root / "image")
 
     val resultsFolder: os.Path = root / "results"
 
@@ -138,7 +134,8 @@ object Main {
     Mono.defer { () =>
       vm.powerState() match {
         case PowerState.RUNNING => Mono.just(())
-        case PowerState.STOPPED => vm.startAsync().map(_ => ())
+        case PowerState.STOPPED => vm.startAsync().map(_ => ()).retry()
+        case PowerState.DEALLOCATED => vm.startAsync().map(_ => ()).retry()
         case _ => ???
       }
     }
@@ -171,7 +168,7 @@ object Main {
     val rootName = new Name(config.resourceGroupPrefix())
       .sub(folderStructure.experimentsData.name)
 
-    val experimentInstances = folderStructure.experimentsData
+    val groupedExperimentInstances = folderStructure.experimentsData
       .experimentInstances
       .iterator
       .filter { experimentalData =>
@@ -186,26 +183,33 @@ object Main {
       .grouped(config.parallelClusters())
       .toList
 
-    val tasks = Future.sequence {
+    val experimentInstancesByParallelism: List[(Seq[ExperimentDataInstance],Int)] =
       (0 until config.parallelClusters()).iterator
         .map { parallelismIdx =>
+          (groupedExperimentInstances
+            .flatMap(_.lift(parallelismIdx))
+            .sortBy(-_.serverCount), // do widest reps first
+            parallelismIdx)
+        }
+        .toList
+
+    val tasks = Future.sequence {
+      experimentInstancesByParallelism.map {
+        case (experimentDataInstances, parallelismIdx) =>
           Future {
             blocking {
-              experimentInstances.iterator
-                .filter(_.isDefinedAt(parallelismIdx))
-                .map(_(parallelismIdx))
-                .foreach { experimentData =>
-                  runExperiment(
-                    config = config,
-                    resourceManager = resourceManager,
-                    rootName = rootName.sub((parallelismIdx + 1).toString),
-                    folderStructure = folderStructure,
-                    experimentData = experimentData,
-                    resultsFolder = folderStructure.resultsFolder / experimentData.fullName)
-                }
+              experimentDataInstances.foreach { experimentData =>
+                runExperiment(
+                  config = config,
+                  resourceManager = resourceManager,
+                  rootName = rootName.sub((parallelismIdx + 1).toString),
+                  folderStructure = folderStructure,
+                  experimentData = experimentData,
+                  resultsFolder = folderStructure.resultsFolder / experimentData.fullName)
+              }
             }
           }
-        }
+      }
     }
     Await.result(tasks, Duration.Inf)
   }
@@ -242,22 +246,21 @@ object Main {
       .retry()
       .block()
 
-    def mkMachine(name: Name): Mono[VirtualMachine] = {
-      println(s"create/find machine $name...")
-      val vmName = name.sub("vm")
+    def mkMachine(vmName: Name): Mono[VirtualMachine] = {
+      println(s"create/find machine $vmName...")
       resourceManager.virtualMachines()
         .getByResourceGroupAsync(resourceGroup.name(), vmName)
         .onErrorResume { err =>
           println(s"error looking up $vmName: ${err.getMessage}. abandoning fast path, try to create/update it instead")
           for {
             publicIP <- resourceManager.publicIpAddresses()
-              .define(name.sub("public-ip"))
+              .define(vmName.sub("public-ip"))
               .withRegion(region)
               .withExistingResourceGroup(resourceGroup)
               .withDynamicIP()
               .createAsync()
             networkInterface <- resourceManager.networkInterfaces()
-              .define(name.sub("net"))
+              .define(vmName.sub("net"))
               .withRegion(region)
               .withExistingResourceGroup(resourceGroup)
               .withExistingPrimaryNetwork(network)
@@ -266,7 +269,7 @@ object Main {
               .withExistingPrimaryPublicIPAddress(publicIP)
               .createAsync()
             virtualMachine <- resourceManager.virtualMachines()
-              .define(name.sub("vm"))
+              .define(vmName)
               .withRegion(region)
               .withExistingResourceGroup(resourceGroup)
               .withExistingPrimaryNetworkInterface(networkInterface)
@@ -304,47 +307,33 @@ object Main {
     // for use later, see the finally branch and the "run experiment" section
     val serverClosersAndReaders = mutable.ListBuffer.empty[(() => Unit, Future[Unit])]
     try {
-      println(s"machines found/created:${
+      println("ensuring vms are started...")
+      Flux.merge(ensureStarted(clientVM), Flux.merge(serverVMs.view.map(ensureStarted).asJava))
+        .blockLast()
+      println("...vms are now started")
+      println(s"machines started:${
         (Iterator.single(clientVM) ++ serverVMs.iterator)
           .map(vm => s"\n - ${vm.name()} (public IP: ${vm.getPrimaryPublicIPAddress.ipAddress()})")
           .mkString
       }")
 
-      println("ensuring vms are started...")
-      Flux.merge(ensureStarted(clientVM).retry(), Flux.merge(serverVMs.view.map(ensureStarted).map(_.retry()).asJava))
-        .blockLast()
-      println("...vms are now started")
-
       // provisioning block:
       locally {
         println("provisioning...")
-        val provisioningTasks =
+        val provisioningTasks = (clientVM :: serverVMs).map { serverVM =>
           Future {
             blocking {
-              (clientVM.name(), provisionVM(
-                name = clientVM.name(),
-                image = folderStructure.clientImage,
+              provisionVM(
+                name = serverVM.name(),
+                image = folderStructure.image,
                 resultsFolder = resultsFolder,
-                provisionCmd = experimentsData.clientProvisionCmd,
+                provisionCmd = experimentsData.provisionCmd,
                 publicKey = folderStructure.sshKeyPublic,
                 privateKey = folderStructure.sshKeyPrivate,
-                publicIP = clientVM.getPrimaryPublicIPAddress.ipAddress()))
+                publicIP = serverVM.getPrimaryPublicIPAddress.ipAddress())
             }
-          } ::
-            serverVMs.map { serverVM =>
-              Future {
-                blocking {
-                  (serverVM.name(), provisionVM(
-                    name = serverVM.name(),
-                    image = folderStructure.serverImage,
-                    resultsFolder = resultsFolder,
-                    provisionCmd = experimentsData.serverProvisionCmd,
-                    publicKey = folderStructure.sshKeyPublic,
-                    privateKey = folderStructure.sshKeyPrivate,
-                    publicIP = serverVM.getPrimaryPublicIPAddress.ipAddress()))
-                }
-              }
-            }
+          }
+        }
 
         Await.result(Future.sequence(provisioningTasks), Duration.Inf)
         println("...done provisioning")
@@ -370,18 +359,33 @@ object Main {
               val publicIP = serverVM.getPrimaryPublicIPAddress.ipAddress()
               println(s"starting server on ${serverVM.name()} ($publicIP) via SSH...")
               val sshClient = connectSSH(privateKey = folderStructure.sshKeyPrivate, publicKey = folderStructure.sshKeyPublic, host = publicIP)
+              val session = sshClient.startSession()
+              val cmd = session.exec(s"export AZ_SERVER_IPS=$serverIps AZ_SERVER_IDX=$serverIdx $configKVs && cd image && ${experimentData.serverCmd} 2>&1")
               val reader: Future[Unit] = Future {
                 blocking {
-                  Using.resource(sshClient.startSession()) { session =>
-                    Using.resource(session.exec(s"export AZ_SERVER_IPS=$serverIps AZ_SERVER_IDX=$serverIdx $configKVs && cd image && ${experimentData.serverCmd} 2>&1")) { cmd =>
-                      Using.resource(os.write.over.outputStream(resultsFolder / s"run-${serverVM.name()}.txt", createFolders = true)) { out =>
-                        cmd.getInputStream.transferTo(out)
+                  Using.resource(os.write.over.outputStream(resultsFolder / s"run-${serverVM.name()}.txt", createFolders = true)) { out =>
+                    ignoreNonFatalExceptions(cmd.getInputStream.transferTo(out))
+                  }
+                }
+              }
+              ({ () =>
+                ignoreNonFatalExceptions {
+                  try {
+                    cmd.signal(Signal.TERM)
+                    cmd.join()
+                  } finally {
+                    try {
+                      cmd.close()
+                    } finally {
+                      try {
+                        session.close()
+                      } finally {
+                        sshClient.close()
                       }
                     }
                   }
                 }
-              }
-              (() => sshClient.close(), reader)
+              }, reader)
             }
         }
 
@@ -399,7 +403,19 @@ object Main {
               val readerFuture: Future[Unit] = Future {
                 blocking {
                   Using.resource(os.write.over.outputStream(resultsFolder / "client-progress.txt", createFolders = true)) { out =>
-                    cmd.getInputStream.transferTo(out)
+                    val buffer = new Array[Byte](4096)
+                    ignoreNonFatalExceptions {
+                      // tee client progress to file and console
+                      Iterator.continually(cmd.getInputStream.read(buffer))
+                        .takeWhile(_ != -1)
+                        .foreach { readCount =>
+                          Console.out.synchronized {
+                            // assuming nothing else writes to the console, this should generate... presentable (?) output
+                            Console.out.write(buffer, 0, readCount)
+                          }
+                          out.write(buffer, 0, readCount)
+                        }
+                    }
                   }
                 }
               }
@@ -419,10 +435,19 @@ object Main {
       }
     } finally {
       println("closing all SSH sessions...")
-      serverClosersAndReaders.foreach(_._1())
+      Await.result(Future.sequence(serverClosersAndReaders.map(pair => Future(blocking(pair._1())))), Duration.Inf)
       println("waiting for all server SSH connections to drop...")
       Await.result(Future.sequence(serverClosersAndReaders.map(_._2)), Duration.Inf)
       println("...all server SSH connections dropped")
+    }
+  }
+
+  private def ignoreNonFatalExceptions(body: =>Unit): Unit = {
+    try {
+      body
+    } catch {
+      case NonFatal(err) =>
+        println(s"ignoring nonfatal exception ${err.getMessage}")
     }
   }
 
@@ -458,11 +483,72 @@ object Main {
     withConnectedSSH(privateKey = privateKey, publicKey = publicKey, host = publicIP) { sshClient =>
       // copy over / update all files via SFTP
       locally {
-        println(s"sending files to $name ($publicIP) via SCP...")
+        println(s"sending files to $name ($publicIP) via SFTP...")
         val imageRoot: os.Path = image.root
-        val scpTransfer = sshClient.newSCPFileTransfer()
-        scpTransfer.upload(imageRoot.toString(), "image")
-        //sftpClient.put(imageRoot.toString(), "image")
+
+        val mtimes = mutable.HashMap.empty[os.RelPath, Long]
+        os.walk.stream(imageRoot, preOrder = false, includeTarget = true).foreach { path =>
+          val relpath = path.relativeTo(imageRoot)
+          Iterator.iterate(relpath)(_ / os.up)
+            .takeWhile(_.ups == 0)
+            .foreach { relpath =>
+              mtimes(relpath) = os.stat(path).mtime.to(TimeUnit.SECONDS) max mtimes.getOrElse(relpath, Long.MinValue)
+            }
+        }
+
+        implicit final class PathHelpers(path: os.Path) {
+          def asRemote: String = s"image/${path.relativeTo(imageRoot).toString()}"
+          def mtime: Long = mtimes(path.relativeTo(imageRoot))
+        }
+
+        Using.resource(sshClient.newSFTPClient()) { sftpClient =>
+          def impl(path: os.Path): Future[Unit] =
+            Future {
+              val localInfo = blocking(os.stat(path))
+              val shouldSkip = blocking {
+                sftpClient.statExistence(path.asRemote) match {
+                  case null => false
+                  case remoteStat =>
+                    val shouldSkip = remoteStat.getMtime >= path.mtime &&
+                      remoteStat.getSize == localInfo.size
+
+                    shouldSkip
+                }
+              }
+              (localInfo, shouldSkip)
+            }.flatMap {
+              case (localInfo, shouldSkip) =>
+                (path, localInfo) match {
+                  case _ if shouldSkip =>
+                    Future {
+                      //println(s"at $name ($publicIP) skipping unmodified ${path.asRemote}")
+                    }
+                  case (file, info) if info.isFile =>
+                    Future {
+                      blocking {
+                        println(s"at $name ($publicIP) updating file ${file.asRemote}")
+                        sftpClient.put(file.toString(), file.asRemote)
+                        sftpClient.chmod(file.asRemote, os.perms(file).value)
+                      }
+                    }
+                  case (dir, info) if info.isDir =>
+                    (if(sftpClient.statExistence(dir.asRemote) == null) {
+                      Future {
+                        println(s"at $name ($publicIP) mkdir ${dir.asRemote}")
+                        blocking(sftpClient.mkdir(dir.asRemote))
+                      }
+                    } else Future.unit).flatMap { _ =>
+                      Future.sequence(os.list.stream(dir).map(impl).toList).map(_ => ())
+                    }
+                  case (other, _) =>
+                    Future {
+                      println(s"ignoring ${other.relativeTo(imageRoot)}; neither a file nor a directory")
+                    }
+                }
+            }
+
+          Await.result(impl(imageRoot), Duration.Inf)
+        }
         println(s"...sent files to $name ($publicIP)")
       }
 
