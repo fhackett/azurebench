@@ -58,36 +58,51 @@ object Main {
     implicit val r: Reader[ExperimentsData] = macroR
   }
 
+  final case class ConfigList(configs: List[Map[String,AnyQuantity]]) {
+    require(configs.forall(config => config.contains("serverCount") &&
+      config("serverCount").values.forall(_.toIntOption.nonEmpty)),
+      "each config must specify an integer serverCount")
+  }
+  object ConfigList {
+    implicit val r: Reader[ConfigList] = reader[ujson.Value].map {
+      case singleton: ujson.Obj =>
+        ConfigList(List(read[Map[String,AnyQuantity]](singleton, trace = true)))
+      case arr: ujson.Arr =>
+        ConfigList(read[List[Map[String,AnyQuantity]]](arr, trace = true))
+    }
+  }
+
   final case class ExperimentData(name: String,
                                   clientCmd: String,
                                   serverCmd: String,
-                                  keyConfigs: List[String] = Nil,
-                                  serverCount: Quantity[Int],
-                                  config: Map[String,AnyQuantity] = Map.empty) {
+                                  excludeConfigKeys: Set[String] = Set.empty,
+                                  config: ConfigList) {
     def instances(experimentsData: ExperimentsData): List[ExperimentDataInstance] =
-      serverCount.values
-        .flatMap { serverCount =>
-          config.foldLeft(Iterator.single(Map.empty[String,String])) { (acc, kv) =>
-            acc.flatMap { acc =>
-              kv._2.values.map { value =>
-                acc.updated(kv._1, value)
-              }
+      config.configs.flatMap { config =>
+        config.foldLeft(Iterator.single(Map.empty[String, String])) { (acc, kv) =>
+          acc.flatMap { acc =>
+            kv._2.values.map { value =>
+              acc.updated(kv._1, value)
             }
           }
-          .flatMap { config =>
-            (1 to experimentsData.experimentRepetitions)
-              .iterator
-              .map { repeatIdx =>
-                ExperimentDataInstance(
-                  name = name,
-                  clientCmd = clientCmd,
-                  serverCmd = serverCmd,
-                  keyConfigs = keyConfigs,
-                  repeatIdx = repeatIdx,
-                  serverCount = serverCount,
-                  config = config)
-              }
-          }
+        }
+      }
+        .flatMap { config =>
+          (1 to experimentsData.experimentRepetitions)
+            .iterator
+            .map { repeatIdx =>
+              ExperimentDataInstance(
+                name = name,
+                clientCmd = clientCmd,
+                serverCmd = serverCmd,
+                keyConfigs = config.keysIterator
+                  .filterNot(excludeConfigKeys + "serverCount")
+                  .toList
+                  .sorted,
+                repeatIdx = repeatIdx,
+                serverCount = config("serverCount").toInt,
+                config = config.removed("serverCount"))
+            }
         }
   }
   object ExperimentData {
