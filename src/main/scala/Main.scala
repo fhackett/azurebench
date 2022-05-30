@@ -32,7 +32,6 @@ object Main {
 
     val parallelClusters: ScallopOption[Int] = opt[Int](default = Some(1))
     val settlingDelay: ScallopOption[Int] = opt[Int](default = Some(2), descr = "amount of time to wait for servers to be up (in seconds)")
-    val maxRuntime: ScallopOption[Int] = opt[Int](default = Some(5), descr = "maximum time to let an experiment run (in minutes)")
 
     val resourceGroupPrefix: ScallopOption[String] = opt[String](default = Some("azbench"))
 
@@ -436,13 +435,13 @@ object Main {
               }
               serverClosersAndReaders += ((() => (), readerFuture))
 
-              cmd.join(config.maxRuntime(), TimeUnit.MINUTES)
+              cmd.join()
               cmd.close()
               if(cmd.getExitStatus == 0) {
                 os.move(from = resultsFolder / "client-progress.txt", to = resultsFolder / "results.txt", replaceExisting = true)
                 println(s"...client ${clientVM.name()} ($clientIP) finished successfully")
               } else {
-                println(s"!!!client ${clientVM.name()} ($clientIP) did not finish successfully; check client-progress.txt to see what happened")
+                println(s"!!![${experimentData.name}] client ${clientVM.name()} ($clientIP) did not finish successfully; check client-progress.txt to see what happened")
               }
             }
           }
@@ -578,7 +577,7 @@ object Main {
           }
           cmd.join()
           cmd.close()
-          assert(cmd.getExitStatus == 0, s"!!!check $name ($publicIP). something went wrong")
+          assert(cmd.getExitStatus == 0, s"!!![${resultsFolder.last}]check $name ($publicIP). something went wrong")
           println(s"...provisioned $name ($publicIP) via SSH")
 
           Await.result(cmdOutput, Duration.Inf)
