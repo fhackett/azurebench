@@ -359,6 +359,7 @@ object Main {
           .iterator
           .map(_.getPrimaryNetworkInterface.primaryPrivateIP())
           .mkString(",")
+        val privateClientIP = clientVM.getPrimaryNetworkInterface.primaryPrivateIP()
         val configKVs = experimentData.config
           .iterator
           .map {
@@ -374,7 +375,7 @@ object Main {
               println(s"starting server on ${serverVM.name()} ($publicIP) via SSH...")
               val sshClient = connectSSH(privateKey = folderStructure.sshKeyPrivate, publicKey = folderStructure.sshKeyPublic, host = publicIP)
               val session = sshClient.startSession()
-              val cmd = session.exec(s"export AZ_SERVER_IPS=$serverIps AZ_SERVER_IDX=$serverIdx $configKVs && cd image && ${experimentData.serverCmd} 2>&1")
+              val cmd = session.exec(s"export AZ_CLIENT_IP=$privateClientIP AZ_SERVER_IPS=$serverIps AZ_SERVER_IDX=$serverIdx $configKVs && cd image && ${experimentData.serverCmd} 2>&1")
               val reader: Future[Unit] = Future {
                 blocking {
                   Using.resource(os.write.over.outputStream(resultsFolder / s"run-${serverVM.name()}.txt", createFolders = true)) { out =>
@@ -411,7 +412,7 @@ object Main {
           Thread.sleep(config.settlingDelay() * 1000)
 
           Using.resource(sshClient.startSession()) { session =>
-            Using.resource(session.exec(s"export AZ_SERVER_IPS=$serverIps AZ_CLIENT_IP=${
+            Using.resource(session.exec(s"export AZ_CLIENT_IP=$privateClientIP AZ_SERVER_IPS=$serverIps AZ_CLIENT_IP=${
               clientVM.getPrimaryNetworkInterface.primaryPrivateIP()
             } $configKVs && cd image && ${experimentData.clientCmd} 2>&1")) { cmd =>
               val readerFuture: Future[Unit] = Future {
