@@ -364,6 +364,7 @@ object Main {
           .map(_.computerName())
           .mkString(",")
         val privateClientIP = clientVM.getPrimaryNetworkInterface.primaryPrivateIP()
+        val clientHost = clientVM.computerName()
         val configKVs = experimentData.config
           .iterator
           .map {
@@ -379,7 +380,7 @@ object Main {
               println(s"starting server on ${serverVM.name()} ($publicIP) via SSH...")
               val sshClient = connectSSH(privateKey = folderStructure.sshKeyPrivate, publicKey = folderStructure.sshKeyPublic, host = publicIP)
               val session = sshClient.startSession()
-              val cmd = session.exec(s"export AZ_SERVER_HOSTS=$serverHosts AZ_CLIENT_IP=$privateClientIP AZ_SERVER_IPS=$serverIps AZ_SERVER_IDX=$serverIdx $configKVs && cd image && ${experimentData.serverCmd} 2>&1")
+              val cmd = session.exec(s"export AZ_SERVER_HOSTS=$serverHosts AZ_CLIENT_IP=$privateClientIP AZ_SERVER_IPS=$serverIps AZ_CLIENT_HOST=$clientHost AZ_SERVER_IDX=$serverIdx $configKVs && cd image && ${experimentData.serverCmd} 2>&1")
               val reader: Future[Unit] = Future {
                 blocking {
                   Using.resource(os.write.over.outputStream(resultsFolder / s"run-${serverVM.name()}.txt", createFolders = true)) { out =>
@@ -410,7 +411,6 @@ object Main {
 
         // run client
         val clientIP = clientVM.getPrimaryPublicIPAddress.ipAddress()
-        val clientHost = clientVM.computerName()
         println(s"starting client on ${clientVM.name()} ($clientIP) via SSH...")
         withConnectedSSH(privateKey = folderStructure.sshKeyPrivate, publicKey = folderStructure.sshKeyPublic, host = clientIP) { sshClient =>
           println(s"waiting ${config.settlingDelay()} seconds for things to settle")
