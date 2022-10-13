@@ -127,6 +127,25 @@ object Main {
     implicit val rw: ReadWriter[ExperimentDataInstance] = macroRW
   }
 
+  final case class StaticMachineInfo(userName: String = "azbench",
+                                     name: String,
+                                     computerName: String,
+                                     primaryPublicIPAddress: String,
+                                     primaryPrivateIPAddress: String) extends MachineInfo {
+    override object getPrimaryPublicIPAddress extends getPrimaryPublicIPAddress {
+      override def ipAddress(): String = primaryPublicIPAddress
+    }
+
+    override object getPrimaryNetworkInterface extends getPrimaryNetworkInterface {
+      override def primaryPrivateIP(): String = primaryPrivateIPAddress
+    }
+
+    override def azureVM: Option[VirtualMachine] = None
+  }
+  object StaticMachineInfo {
+    implicit val rw: ReadWriter[StaticMachineInfo] = macroRW
+  }
+
   class ImageFolder(path: os.Path) {
     require(os.isDir(path))
     val root: os.Path = path
@@ -139,6 +158,19 @@ object Main {
 
     val experimentsData: ExperimentsData =
       read[ExperimentsData](os.read.stream(root / "experiments.json"), trace = true)
+
+    val staticServerMapPath: os.Path = root / "static_server_map.json"
+    val staticServerMap: Option[Map[String,MachineInfo]] =
+      if(os.isFile(staticServerMapPath)) {
+        Some {
+          val infos = read[List[StaticMachineInfo]](os.read.stream(staticServerMapPath), trace = true)
+          infos.iterator
+            .map(info => info.name -> info)
+            .toMap
+        }
+      } else {
+        None
+      }
 
     val sshKeyPublic: String = os.read(root / "id_rsa.pub")
     val sshKeyPrivate: String = os.read(root / "id_rsa")
@@ -153,8 +185,6 @@ object Main {
         case _ => ???
       }
     }
-
-  private val rootUserName: String = "azbench"
 
   def main(args: Array[String]): Unit = {
     val config = new Config(args)
@@ -228,6 +258,47 @@ object Main {
     Await.result(tasks, Duration.Inf)
   }
 
+  abstract class MachineInfo {
+    def userName: String
+    def name(): String
+    def computerName(): String
+
+    trait getPrimaryPublicIPAddress {
+      def ipAddress(): String
+    }
+    def getPrimaryPublicIPAddress: getPrimaryPublicIPAddress
+
+    trait getPrimaryNetworkInterface {
+      def primaryPrivateIP(): String
+    }
+    def getPrimaryNetworkInterface: getPrimaryNetworkInterface
+
+    def azureVM: Option[VirtualMachine]
+  }
+
+  object MachineInfo {
+    def fromAzureVM(vm: VirtualMachine): MachineInfo =
+      new MachineInfo {
+        override val userName: String = "azbench"
+
+        override def name(): String = vm.name()
+
+        override def computerName(): String = vm.computerName()
+
+        override object getPrimaryPublicIPAddress extends getPrimaryPublicIPAddress {
+          override def ipAddress(): String =
+            vm.getPrimaryPublicIPAddress.ipAddress()
+        }
+
+        override object getPrimaryNetworkInterface extends getPrimaryNetworkInterface {
+          override def primaryPrivateIP(): String =
+            vm.getPrimaryNetworkInterface.primaryPrivateIP()
+        }
+
+        override def azureVM: Option[VirtualMachine] = Some(vm)
+      }
+  }
+
   def runExperiment(config: Config, resourceManager: AzureResourceManager, rootName: Name,
                     folderStructure: FolderStructure, experimentData: ExperimentDataInstance,
                     resultsFolder: os.Path): Unit = {
@@ -238,119 +309,142 @@ object Main {
       writeToOutputStream(experimentData, out)
     }
 
-    println(s"create/find resource group $rootName")
-
-    val resourceGroup = resourceManager.resourceGroups()
-      .define(rootName)
-      .withRegion(region)
-      .createAsync()
-      .retry()
-      .block()
-
-    val networkName = rootName.sub("network")
-    val subnetName = rootName.sub("subnet")
-    println(s"create/find network $networkName...")
-    val network = resourceManager.networks()
-      .define(networkName)
-      .withRegion(region)
-      .withExistingResourceGroup(resourceGroup)
-      .withAddressSpace("10.0.0.0/16")
-      .withSubnet(subnetName, "10.0.0.0/24")
-      .createAsync()
-      .retry()
-      .block()
-
-    def mkMachine(vmName: Name): Mono[VirtualMachine] = {
-      println(s"create/find machine $vmName...")
-      resourceManager.virtualMachines()
-        .getByResourceGroupAsync(resourceGroup.name(), vmName)
-        .onErrorResume { err =>
-          println(s"error looking up $vmName: ${err.getMessage}. abandoning fast path, try to create/update it instead")
-          for {
-            publicIP <- resourceManager.publicIpAddresses()
-              .define(vmName.sub("public-ip"))
-              .withRegion(region)
-              .withExistingResourceGroup(resourceGroup)
-              .withDynamicIP()
-              .createAsync()
-            networkInterface <- resourceManager.networkInterfaces()
-              .define(vmName.sub("net"))
-              .withRegion(region)
-              .withExistingResourceGroup(resourceGroup)
-              .withExistingPrimaryNetwork(network)
-              .withSubnet(subnetName)
-              .withPrimaryPrivateIPAddressDynamic()
-              .withExistingPrimaryPublicIPAddress(publicIP)
-              .createAsync()
-            virtualMachine <- resourceManager.virtualMachines()
-              .define(vmName)
-              .withRegion(region)
-              .withExistingResourceGroup(resourceGroup)
-              .withExistingPrimaryNetworkInterface(networkInterface)
-              .withSpecificLinuxImageVersion(
-                new ImageReference()
-                  .withPublisher("Canonical")
-                  .withOffer("0001-com-ubuntu-server-focal")
-                  .withSku("20_04-lts-gen2")
-                  .withVersion("20.04.202205100"))
-              .withRootUsername(rootUserName)
-              .withSsh(folderStructure.sshKeyPublic)
-              .withComputerName(vmName)
-              .withSize(folderStructure.experimentsData.vmSize)
-              .createAsync()
-          } yield virtualMachine
-        }
-    }
-
     val machineRoot = rootName.sub("vm")
 
-    val (clientVM, serverVMs) = locally {
-      val resultPair =
-        Mono.zip(
-          mkMachine(machineRoot.sub("client")),
-          Flux.mergeSequential(
-            (1 to experimentData.serverCount).view
-              .map(idx => machineRoot.sub(idx.toString))
-              .map(mkMachine)
-              .map(_.retry())
-              .asJava: java.lang.Iterable[Mono[VirtualMachine]]).collectList())
-          .block()
-      (resultPair.getT1, resultPair.getT2.asScala.toList)
-    }
+    val (clientVM, serverVMs) =
+      if(folderStructure.staticServerMap.isEmpty) {
+        val resourceGroup = locally {
+          println(s"create/find resource group $rootName")
+          resourceManager.resourceGroups()
+            .define(rootName)
+            .withRegion(region)
+            .createAsync()
+            .retry()
+            .block()
+        }
+
+        val networkName = rootName.sub("network")
+        val subnetName = rootName.sub("subnet")
+        val network = locally {
+          println(s"create/find network $networkName...")
+          resourceManager.networks()
+            .define(networkName)
+            .withRegion(region)
+            .withExistingResourceGroup(resourceGroup)
+            .withAddressSpace("10.0.0.0/16")
+            .withSubnet(subnetName, "10.0.0.0/24")
+            .createAsync()
+            .retry()
+            .block()
+        }
+
+        def mkMachine(vmName: Name): Mono[VirtualMachine] = {
+          println(s"create/find machine $vmName...")
+          resourceManager.virtualMachines()
+            .getByResourceGroupAsync(resourceGroup.name(), vmName)
+            .onErrorResume { err =>
+              println(s"error looking up $vmName: ${err.getMessage}. abandoning fast path, try to create/update it instead")
+              for {
+                publicIP <- resourceManager.publicIpAddresses()
+                  .define(vmName.sub("public-ip"))
+                  .withRegion(region)
+                  .withExistingResourceGroup(resourceGroup)
+                  .withDynamicIP()
+                  .createAsync()
+                networkInterface <- resourceManager.networkInterfaces()
+                  .define(vmName.sub("net"))
+                  .withRegion(region)
+                  .withExistingResourceGroup(resourceGroup)
+                  .withExistingPrimaryNetwork(network)
+                  .withSubnet(subnetName)
+                  .withPrimaryPrivateIPAddressDynamic()
+                  .withExistingPrimaryPublicIPAddress(publicIP)
+                  .createAsync()
+                virtualMachine <- resourceManager.virtualMachines()
+                  .define(vmName)
+                  .withRegion(region)
+                  .withExistingResourceGroup(resourceGroup)
+                  .withExistingPrimaryNetworkInterface(networkInterface)
+                  .withSpecificLinuxImageVersion(
+                    new ImageReference()
+                      .withPublisher("Canonical")
+                      .withOffer("0001-com-ubuntu-server-focal")
+                      .withSku("20_04-lts-gen2")
+                      .withVersion("20.04.202205100"))
+                  .withRootUsername("azbench")
+                  .withSsh(folderStructure.sshKeyPublic)
+                  .withComputerName(vmName)
+                  .withSize(folderStructure.experimentsData.vmSize)
+                  .createAsync()
+              } yield virtualMachine
+            }
+        }
+
+        val resultPair =
+          Mono.zip(
+            mkMachine(machineRoot.sub("client")),
+            Flux.mergeSequential(
+              (1 to experimentData.serverCount).view
+                .map(idx => machineRoot.sub(idx.toString))
+                .map(mkMachine)
+                .map(_.retry())
+                .asJava: java.lang.Iterable[Mono[VirtualMachine]]).collectList())
+            .block()
+        (resultPair.getT1, resultPair.getT2.asScala.toList)
+
+        (MachineInfo.fromAzureVM(resultPair.getT1), resultPair.getT2.asScala.toList.map(MachineInfo.fromAzureVM))
+      } else {
+        val clientInfo = folderStructure.staticServerMap.get(machineRoot.sub("client"))
+        val serverInfos = (1 to experimentData.serverCount).view
+          .map(idx => machineRoot.sub(idx.toString))
+          .map(name => folderStructure.staticServerMap.get(name.toString))
+          .toList
+
+        (clientInfo, serverInfos)
+      }
 
     // for use later, see the finally branch and the "run experiment" section
     val serverClosersAndReaders = mutable.ListBuffer.empty[(() => Unit, Future[Unit])]
     try {
-      println("ensuring vms are started...")
-      Flux.merge(ensureStarted(clientVM), Flux.merge(serverVMs.view.map(ensureStarted).asJava))
-        .blockLast()
-      println("...vms are now started")
-      println(s"machines started:${
-        (Iterator.single(clientVM) ++ serverVMs.iterator)
-          .map(vm => s"\n - ${vm.name()} (public IP: ${vm.getPrimaryPublicIPAddress.ipAddress()})")
-          .mkString
-      }")
+      val clientVM_ = clientVM
+      val serverVMs_ = serverVMs
+      if(folderStructure.staticServerMap.isEmpty) {
+        val clientVM = clientVM_.azureVM.get
+        val serverVMs = serverVMs_.map(_.azureVM.get)
 
-      // provisioning block:
-      locally {
-        println("provisioning...")
-        val provisioningTasks = (clientVM :: serverVMs).map { serverVM =>
-          Future {
-            blocking {
-              provisionVM(
-                name = serverVM.name(),
-                image = folderStructure.image,
-                resultsFolder = resultsFolder,
-                provisionCmd = experimentsData.provisionCmd,
-                publicKey = folderStructure.sshKeyPublic,
-                privateKey = folderStructure.sshKeyPrivate,
-                publicIP = serverVM.getPrimaryPublicIPAddress.ipAddress())
+        println("ensuring vms are started...")
+        Flux.merge(ensureStarted(clientVM), Flux.merge(serverVMs.view.map(ensureStarted).asJava))
+          .blockLast()
+        println("...vms are now started")
+        println(s"machines started:${
+          (Iterator.single(clientVM) ++ serverVMs.iterator)
+            .map(vm => s"\n - ${vm.name()} (public IP: ${vm.getPrimaryPublicIPAddress.ipAddress()})")
+            .mkString
+        }")
+
+        // provisioning block:
+        locally {
+          println("provisioning...")
+          val provisioningTasks = (clientVM :: serverVMs).map { serverVM =>
+            Future {
+              blocking {
+                provisionVM(
+                  name = serverVM.name(),
+                  image = folderStructure.image,
+                  resultsFolder = resultsFolder,
+                  provisionCmd = experimentsData.provisionCmd,
+                  publicKey = folderStructure.sshKeyPublic,
+                  privateKey = folderStructure.sshKeyPrivate,
+                  publicIP = serverVM.getPrimaryPublicIPAddress.ipAddress())
+              }
             }
           }
-        }
 
-        Await.result(Future.sequence(provisioningTasks), Duration.Inf)
-        println("...done provisioning")
+          Await.result(Future.sequence(provisioningTasks), Duration.Inf)
+          println("...done provisioning")
+        }
+      } else {
+        println(s"skipping provisioning due to static server map ${folderStructure.staticServerMapPath}")
       }
 
       // run the experiment
@@ -378,7 +472,7 @@ object Main {
             serverClosersAndReaders += locally {
               val publicIP = serverVM.getPrimaryPublicIPAddress.ipAddress()
               println(s"starting server on ${serverVM.name()} ($publicIP) via SSH...")
-              val sshClient = connectSSH(privateKey = folderStructure.sshKeyPrivate, publicKey = folderStructure.sshKeyPublic, host = publicIP)
+              val sshClient = connectSSH(userName = serverVM.userName, privateKey = folderStructure.sshKeyPrivate, publicKey = folderStructure.sshKeyPublic, host = publicIP)
               val session = sshClient.startSession()
               val cmd = session.exec(s"export AZ_SERVER_HOSTS=$serverHosts AZ_CLIENT_IP=$privateClientIP AZ_SERVER_IPS=$serverIps AZ_CLIENT_HOST=$clientHost AZ_SERVER_IDX=$serverIdx $configKVs && cd image && ${experimentData.serverCmd} 2>&1")
               val reader: Future[Unit] = Future {
@@ -412,7 +506,7 @@ object Main {
         // run client
         val clientIP = clientVM.getPrimaryPublicIPAddress.ipAddress()
         println(s"starting client on ${clientVM.name()} ($clientIP) via SSH...")
-        withConnectedSSH(privateKey = folderStructure.sshKeyPrivate, publicKey = folderStructure.sshKeyPublic, host = clientIP) { sshClient =>
+        withConnectedSSH(userName = clientVM.userName, privateKey = folderStructure.sshKeyPrivate, publicKey = folderStructure.sshKeyPublic, host = clientIP) { sshClient =>
           println(s"waiting ${config.settlingDelay()} seconds for things to settle")
           Thread.sleep(config.settlingDelay() * 1000)
 
@@ -445,7 +539,7 @@ object Main {
                 os.move(from = resultsFolder / "client-progress.txt", to = resultsFolder / "results.txt", replaceExisting = true)
                 println(s"...client ${clientVM.name()} ($clientIP) finished successfully")
               } else {
-                println(s"!!![${experimentData.name}] client ${clientVM.name()} ($clientIP) did not finish successfully; check client-progress.txt to see what happened")
+                println(s"!!![${experimentData.name}] client ${clientVM.name()} ($clientIP) did not finish successfully (? = ${cmd.getExitStatus}); check client-progress.txt to see what happened")
               }
             }
           }
@@ -469,7 +563,7 @@ object Main {
     }
   }
 
-  private def connectSSH(privateKey: String, publicKey: String, host: String): SSHClient = {
+  private def connectSSH(userName: String, privateKey: String, publicKey: String, host: String): SSHClient = {
     val sshClient = new SSHClient()
     sshClient.addHostKeyVerifier(new PromiscuousVerifier)
     sshClient.useCompression()
@@ -477,12 +571,12 @@ object Main {
     connectWithRetry(sshClient = sshClient, host = host)
 
     val keyProvider = sshClient.loadKeys(privateKey, publicKey, null)
-    sshClient.authPublickey(rootUserName, keyProvider)
+    sshClient.authPublickey(userName, keyProvider)
     sshClient
   }
 
-  private def withConnectedSSH[T](privateKey: String, publicKey: String, host: String)(fn: SSHClient => T): T =
-    Using.resource(connectSSH(privateKey = privateKey, publicKey = publicKey, host = host))(fn)
+  private def withConnectedSSH[T](userName: String, privateKey: String, publicKey: String, host: String)(fn: SSHClient => T): T =
+    Using.resource(connectSSH(userName = userName, privateKey = privateKey, publicKey = publicKey, host = host))(fn)
 
   @tailrec
   private def connectWithRetry(sshClient: SSHClient, host: String): Unit = {
@@ -498,7 +592,7 @@ object Main {
 
   private def provisionVM(name: String, image: ImageFolder, resultsFolder: os.Path, provisionCmd: String, publicKey: String, privateKey: String, publicIP: String): Unit = {
     println(s"provisioning $name ($publicIP) via SSH...")
-    withConnectedSSH(privateKey = privateKey, publicKey = publicKey, host = publicIP) { sshClient =>
+    withConnectedSSH(userName = "azbench", privateKey = privateKey, publicKey = publicKey, host = publicIP) { sshClient =>
       // copy over / update all files via SFTP
       locally {
         println(s"sending files to $name ($publicIP) via SFTP...")
