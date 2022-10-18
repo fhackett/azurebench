@@ -34,10 +34,17 @@ object Main {
     val settlingDelay: ScallopOption[Int] = opt[Int](default = Some(2), descr = "amount of time to wait for servers to be up (in seconds)")
 
     val resourceGroupPrefix: ScallopOption[String] = opt[String](default = Some("azbench"))
+    val existingResourceGroupName: ScallopOption[String] = opt[String]()
+
+    val azureRetryCount: ScallopOption[Int] = opt[Int](default = Some(10))
 
     val benchmarkFolder: ScallopOption[String] = trailArg[String]()
 
     verify()
+
+    if(existingResourceGroupName.isDefined) {
+      require(parallelClusters() == 1)
+    }
   }
 
   implicit val vmSizeReader: Reader[VirtualMachineSizeTypes] = reader[String].map(VirtualMachineSizeTypes.fromString)
@@ -176,12 +183,12 @@ object Main {
     val sshKeyPrivate: String = os.read(root / "id_rsa")
   }
 
-  private def ensureStarted(vm: VirtualMachine): Mono[Unit] =
+  private def ensureStarted(config: Config, vm: VirtualMachine): Mono[Unit] =
     Mono.defer { () =>
       vm.powerState() match {
         case PowerState.RUNNING => Mono.just(())
-        case PowerState.STOPPED => vm.startAsync().map(_ => ()).retry()
-        case PowerState.DEALLOCATED => vm.startAsync().map(_ => ()).retry()
+        case PowerState.STOPPED => vm.startAsync().map(_ => ()).retry(config.azureRetryCount())
+        case PowerState.DEALLOCATED => vm.startAsync().map(_ => ()).retry(config.azureRetryCount())
         case _ => ???
       }
     }
@@ -192,7 +199,7 @@ object Main {
 
     val folderStructure = new FolderStructure(benchFolder)
 
-    val resourceManager = {
+    lazy val resourceManager = {
       val credentialBuilder = new DefaultAzureCredentialBuilder()
       if (config.azureTenantId.isDefined) {
         credentialBuilder.tenantId(config.azureTenantId())
@@ -299,7 +306,7 @@ object Main {
       }
   }
 
-  def runExperiment(config: Config, resourceManager: AzureResourceManager, rootName: Name,
+  def runExperiment(config: Config, resourceManager: =>AzureResourceManager, rootName: Name,
                     folderStructure: FolderStructure, experimentData: ExperimentDataInstance,
                     resultsFolder: os.Path): Unit = {
     val region = Region.US_EAST
@@ -313,14 +320,21 @@ object Main {
 
     val (clientVM, serverVMs) =
       if(folderStructure.staticServerMap.isEmpty) {
-        val resourceGroup = locally {
-          println(s"create/find resource group $rootName")
-          resourceManager.resourceGroups()
-            .define(rootName)
-            .withRegion(region)
-            .createAsync()
-            .retry()
-            .block()
+        val resourceGroup = config.existingResourceGroupName.toOption match {
+          case None =>
+            println(s"create/find resource group $rootName")
+            resourceManager.resourceGroups()
+              .define(rootName)
+              .withRegion(region)
+              .createAsync()
+              .retry(config.azureRetryCount())
+              .block()
+          case Some(name) =>
+            println(s"finding existing resource group $name")
+            resourceManager.resourceGroups()
+              .getByNameAsync(name)
+              .retry(config.azureRetryCount())
+              .block()
         }
 
         val networkName = rootName.sub("network")
@@ -334,7 +348,7 @@ object Main {
             .withAddressSpace("10.0.0.0/16")
             .withSubnet(subnetName, "10.0.0.0/24")
             .createAsync()
-            .retry()
+            .retry(config.azureRetryCount())
             .block()
         }
 
@@ -387,13 +401,14 @@ object Main {
               (1 to experimentData.serverCount).view
                 .map(idx => machineRoot.sub(idx.toString))
                 .map(mkMachine)
-                .map(_.retry())
+                .map(_.retry(config.azureRetryCount()))
                 .asJava: java.lang.Iterable[Mono[VirtualMachine]]).collectList())
             .block()
         (resultPair.getT1, resultPair.getT2.asScala.toList)
 
         (MachineInfo.fromAzureVM(resultPair.getT1), resultPair.getT2.asScala.toList.map(MachineInfo.fromAzureVM))
       } else {
+        println(s"using contents of ${folderStructure.staticServerMapPath} for server info")
         val clientInfo = folderStructure.staticServerMap.get(machineRoot.sub("client"))
         val serverInfos = (1 to experimentData.serverCount).view
           .map(idx => machineRoot.sub(idx.toString))
@@ -413,7 +428,7 @@ object Main {
         val serverVMs = serverVMs_.map(_.azureVM.get)
 
         println("ensuring vms are started...")
-        Flux.merge(ensureStarted(clientVM), Flux.merge(serverVMs.view.map(ensureStarted).asJava))
+        Flux.merge(ensureStarted(config, clientVM), Flux.merge(serverVMs.view.map(ensureStarted(config, _)).asJava))
           .blockLast()
         println("...vms are now started")
         println(s"machines started:${
